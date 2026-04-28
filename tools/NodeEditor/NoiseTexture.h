@@ -24,14 +24,16 @@ namespace Magnum
             GenType_2D,
             GenType_2DTiled,
             GenType_3D,
+            GenType_3DCube,
             GenType_4D,
             GenType_Count
         };
 
-        inline static const char* GenTypeStrings = 
+        inline static const char* GenTypeStrings =
             "2D\0"
             "2D Tiled\0"
             "3D Slice\0"
+            "3D Cube\0"
             "4D Slice\0";
 
         NoiseTexture();

@@ -29,6 +29,7 @@ namespace Magnum
         void Draw( const Matrix4& transformation, const Matrix4& projection, const Vector3& cameraPosition );
         void SetSIMDLevel( FastSIMD::FeatureSet lvl );
         void DoIpcPolling();
+        MeshNoisePreview& GetMeshPreview() { return mMeshNoisePreview; }
 
     private:
         struct Node
@@ -69,7 +70,11 @@ namespace Magnum
             std::vector<int64_t> generateAverages;
 
             static const int NoiseSize = 224;
+            static const int CubeFrames = 16;
+            static const int CubeVolumeSize = 64;
+            static const int CubeRenderSize = 128;
             GL::Texture2D noiseTexture;
+            bool isCubeStrip = false;
         };
 
         struct MetadataMenu
@@ -147,6 +152,9 @@ namespace Magnum
         float mNodeScale = 2.5f;
         int mNodeSeed = 1337;
         NoiseTexture::GenType mNodeGenType = NoiseTexture::GenType_2D;
+        float mCubeSpinRotPerSec = 0.25f;
+        float mCubeScale = 1.0f;
+        bool mNodePreviewUseColors = true;
 
         FastSIMD::FeatureSet mMaxFeatureSet    = FastSIMD::FeatureSet::Max;
         FastSIMD::FeatureSet mActualFeatureSet = FastSIMD::FeatureSet::Invalid;

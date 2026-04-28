@@ -523,6 +523,7 @@ NoiseTexture::TextureData NoiseTexture::BuildTexture( const BuildData& buildData
         break;
 
     case GenType_3D:
+    case GenType_3DCube:
         minMax = gen->GenUniformGrid3D( noiseData.data(),
             xOffset, yOffset, buildData.offset.z(),
             buildData.size.x(), buildData.size.y(), 1, buildData.scale, buildData.scale, buildData.scale, buildData.seed );

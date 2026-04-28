@@ -210,6 +210,8 @@ void NodeEditorApp::drawEvent()
             }
         }
 
+        bool orbitMode = mNodeEditor.GetMeshPreview().GetOrbitMode();
+
         // Update camera pos
         Vector3 cameraVelocity( 0 );
         if( mKeyDown[Key_W] || mKeyDown[Key_Up] )
@@ -243,12 +245,38 @@ void NodeEditorApp::drawEvent()
 
         cameraVelocity *= mFrameTime.previousFrameDuration() * 80.0f;
 
-        if( !cameraVelocity.isZero() )
+        if( !orbitMode && !cameraVelocity.isZero() )
         {
             Matrix4 transform = mCameraObject.transformation();
             transform.translation() += transform.rotation() * cameraVelocity;
             mCameraObject.setTransformation( transform );
         }
+
+        if( orbitMode )
+        {
+            auto& mesh = mNodeEditor.GetMeshPreview();
+            bool shift = mKeyDown[Key_LShift] || mKeyDown[Key_RShift];
+
+            if( shift )
+            {
+                float dh = 0.0f;
+                if( mKeyDown[Key_W] || mKeyDown[Key_Up] )    dh += 1.0f;
+                if( mKeyDown[Key_S] || mKeyDown[Key_Down] )  dh -= 1.0f;
+                dh *= mFrameTime.previousFrameDuration() * 80.0f;
+                if( dh != 0.0f )
+                {
+                    mesh.SetOrbitHeight( mesh.GetOrbitHeight() + dh );
+                }
+            }
+
+            Vector3 center( 0.0f, mesh.GetOrbitHeight(), 0.0f );
+            float dist = mesh.GetOrbitDistance();
+            Matrix4 rot = Matrix4::rotationY( Deg{ mLookAngle.x() } ) * Matrix4::rotationX( Deg{ mLookAngle.y() } );
+            Vector3 eye = center + rot.rotationNormalized() * Vector3( 0.0f, 0.0f, dist );
+            mCameraObject.setTransformation( Matrix4::lookAt( eye, center, Vector3::yAxis() ) );
+        }
+
+        UpdatePespectiveProjection();
 
         if( mBackFaceCulling )
         {
@@ -383,6 +411,23 @@ void NodeEditorApp::scrollEvent( ScrollEvent& event ) {
         event.setAccepted();
         return;
     }
+
+    auto& mesh = mNodeEditor.GetMeshPreview();
+    if( mesh.GetOrbitMode() )
+    {
+        bool shift = ( event.modifiers() & ScrollEvent::Modifier::Shift ) == ScrollEvent::Modifier::Shift;
+        if( shift )
+        {
+            float step = mesh.GetOrbitDistance() * 0.05f * event.offset().y();
+            mesh.SetOrbitHeight( mesh.GetOrbitHeight() + step );
+        }
+        else
+        {
+            float factor = std::pow( 0.9f, event.offset().y() );
+            mesh.SetOrbitDistance( mesh.GetOrbitDistance() * factor );
+        }
+        event.setAccepted();
+    }
 }
 
 void NodeEditorApp::pointerMoveEvent( PointerMoveEvent& event )
@@ -417,7 +462,8 @@ void NodeEditorApp::textInputEvent( TextInputEvent& event )
 
 void NodeEditorApp::UpdatePespectiveProjection()
 {
-    mCamera.setProjectionMatrix( Matrix4::perspectiveProjection( Deg( 70.0f ), Vector2{ windowSize() }.aspectRatio(), 2.0f, 3500.0f ) );
+    float fov = mNodeEditor.GetMeshPreview().GetFovDeg();
+    mCamera.setProjectionMatrix( Matrix4::perspectiveProjection( Deg( fov ), Vector2{ windowSize() }.aspectRatio(), 2.0f, 3500.0f ) );
 }
 
 

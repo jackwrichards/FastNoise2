@@ -58,10 +58,12 @@ in highp vec4 positionLight;
 /* Outputs */
 
 out highp float interpolatedLight;
+out highp float worldHeight;
 
-void main() 
+void main()
 {
     gl_Position = transformationProjectionMatrix * vec4(positionLight.xyz, 1.0);
 
     interpolatedLight = positionLight.w;
+    worldHeight = positionLight.y;
 }

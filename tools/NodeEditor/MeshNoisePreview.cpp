@@ -3,6 +3,7 @@
 #include <thread>
 #include <bit>
 
+#include <Corrade/Containers/ArrayView.h>
 #include <Corrade/Utility/Resource.h>
 #include <Magnum/Math/Color.h>
 #include <Magnum/Math/Frustum.h>
@@ -81,9 +82,23 @@ MeshNoisePreview::MeshNoisePreview()
     mBuildData.seed = 1337;
     mBuildData.isoSurface = 0.0f;
     mBuildData.heightmapMultiplier = 100.0f;
-    mBuildData.color = Color3( 1.0f );
     mBuildData.meshType = MeshType_DualMarchingCubes3D;
     mBuildData.upAxis = UpAxis_Y;
+
+    mColorLayers = {
+        { Color3::fromSrgbInt( 0x4A4A4Au ), -1e30f },     // base: stone
+        { Color3::fromSrgbInt( 0x6B4F2Au ),    0.0f },    // dirt
+        { Color3::fromSrgbInt( 0x4F8A3Cu ),   15.0f },    // grass
+        { Color3::fromSrgbInt( 0x8C8C8Cu ),   60.0f },    // rock
+        { Color3::fromSrgbInt( 0xF4F4F8u ),   90.0f },    // snow
+    };
+    mLayerSmoothness = 1.5f;
+
+    mBorderShader = Shaders::FlatGL3D{};
+    mBorderBuffer = GL::Buffer{};
+    mBorderMesh = GL::Mesh{};
+    mBorderMesh.setPrimitive( GL::MeshPrimitive::Lines )
+        .addVertexBuffer( mBorderBuffer, 0, Shaders::FlatGL3D::Position{} );
 
     uint32_t threadCount = std::max( 2u, std::thread::hardware_concurrency() );
 
@@ -157,6 +172,10 @@ void MeshNoisePreview::Draw( const Matrix4& transformation, const Matrix4& proje
 
     Frustum camFrustum = Frustum::fromMatrix( transformationProjection );
     mShader.SetTransformationProjectionMatrix( transformationProjection );
+    UploadColorLayers();
+
+    if( mBorderDirty ) RebuildBorderMesh();
+    DrawBorder( transformationProjection );
 
     mTriCount = 0;
     mMeshesCount = 0;
@@ -199,10 +218,117 @@ void MeshNoisePreview::Draw( const Matrix4& transformation, const Matrix4& proje
         edited |= ImGuiExtra::ScrollCombo( reinterpret_cast<int*>( &mUpAxis ), UpAxis_Count );
     }
 
-    if( ImGui::ColorEdit3( "Mesh Colour", mBuildData.color.data() ) )
+    if( ImGui::CollapsingHeader( "Color Layers", ImGuiTreeNodeFlags_DefaultOpen ) )
     {
-        mShader.SetColorTint( mBuildData.color );
-        ImGuiExtra::MarkSettingsDirty();
+        bool layersEdited = false;
+        int removeIdx = -1;
+
+        for( size_t i = 0; i < mColorLayers.size(); ++i )
+        {
+            ImGui::PushID( (int)i );
+
+            if( ImGui::ColorEdit3( "##color", mColorLayers[i].color.data(), ImGuiColorEditFlags_NoInputs ) )
+            {
+                layersEdited = true;
+            }
+
+            ImGui::SameLine();
+            if( i == 0 )
+            {
+                ImGui::TextDisabled( "base" );
+            }
+            else
+            {
+                ImGui::SetNextItemWidth( 120.0f );
+                if( ImGui::DragFloat( "##threshold", &mColorLayers[i].threshold, 0.5f, 0, 0, "Y >= %.1f" ) )
+                {
+                    layersEdited = true;
+                }
+            }
+
+            ImGui::SameLine();
+            if( ImGui::SmallButton( "x" ) && mColorLayers.size() > 1 )
+            {
+                removeIdx = (int)i;
+            }
+
+            ImGui::PopID();
+        }
+
+        if( removeIdx >= 0 )
+        {
+            mColorLayers.erase( mColorLayers.begin() + removeIdx );
+            if( !mColorLayers.empty() )
+            {
+                mColorLayers.front().threshold = -1e30f;
+            }
+            layersEdited = true;
+        }
+
+        if( (int)mColorLayers.size() < VertexLightShader::MAX_COLOR_LAYERS && ImGui::SmallButton( "+ Add Layer" ) )
+        {
+            float topThreshold = mColorLayers.empty() ? 0.0f : mColorLayers.back().threshold;
+            mColorLayers.push_back( { Color3( 1.0f ), topThreshold + 10.0f } );
+            layersEdited = true;
+        }
+
+        if( ImGui::DragFloat( "Layer Smoothness", &mLayerSmoothness, 0.05f, 0.0f, 1000.0f, "%.2f" ) )
+        {
+            layersEdited = true;
+        }
+
+        if( layersEdited )
+        {
+            ImGuiExtra::MarkSettingsDirty();
+        }
+    }
+
+    if( ImGui::CollapsingHeader( "World Border" ) )
+    {
+        bool borderEdited = false;
+        bool cameraEdited = false;
+        cameraEdited |= ImGui::Checkbox( "Orbit Lock to Border Center", &mOrbitMode );
+        if( mOrbitMode )
+        {
+            cameraEdited |= ImGui::DragFloat( "Orbit Distance", &mOrbitDistance, 1.0f, 5.0f, 5000.0f, "%.1f" );
+            cameraEdited |= ImGui::DragFloat( "Orbit Height", &mOrbitHeight, 0.5f, -5000.0f, 5000.0f, "%.1f" );
+        }
+        cameraEdited |= ImGui::DragFloat( "FOV", &mFovDeg, 0.2f, 20.0f, 120.0f, "%.1f deg" );
+        if( cameraEdited )
+        {
+            ImGuiExtra::MarkSettingsDirty();
+        }
+
+        bool gateEdited = ImGui::Checkbox( "Generate meshes outside of world border", &mGenerateOutsideBorder );
+        borderEdited |= ImGui::Combo( "Shape", reinterpret_cast<int*>( &mBorderShape ), BorderShapeStrings );
+        borderEdited |= ImGuiExtra::ScrollCombo( reinterpret_cast<int*>( &mBorderShape ), BorderShape_Count );
+
+        if( mBorderShape != BorderShape_None )
+        {
+            borderEdited |= ImGui::DragFloat( "Radius / Half-size", &mBorderRadius, 1.0f, 1.0f, 100000.0f, "%.1f" );
+            borderEdited |= ImGui::DragFloat( "Min Y", &mBorderMinY, 0.5f );
+            borderEdited |= ImGui::DragFloat( "Max Y", &mBorderMaxY, 0.5f );
+            borderEdited |= ImGui::DragInt( "Rings", &mBorderRings, 0.1f, 1, 64 );
+
+            if( mBorderShape == BorderShape_Circle )
+            {
+                borderEdited |= ImGui::DragInt( "Segments", &mBorderSegments, 0.5f, 8, 512 );
+            }
+
+            ImGui::ColorEdit3( "Border Color", mBorderColor.data(), ImGuiColorEditFlags_NoInputs );
+        }
+
+        if( borderEdited )
+        {
+            mBorderDirty = true;
+            ImGuiExtra::MarkSettingsDirty();
+        }
+
+        if( gateEdited || ( borderEdited && !mGenerateOutsideBorder ) )
+        {
+            edited = true;
+            ImGuiExtra::MarkSettingsDirty();
+        }
     }
 
     edited |= ImGui::DragInt( "Seed", &mBuildData.seed );
@@ -365,7 +491,8 @@ void MeshNoisePreview::UpdateChunksForPosition( Vector3 position )
 
 
                 if( ( positionI - chunkPos ).dot() <= loadRangeSq &&
-                    !mRegisteredChunkPositions.contains( chunkPos ) )
+                    !mRegisteredChunkPositions.contains( chunkPos ) &&
+                    IsChunkInsideBorder( chunkPos ) )
                 {
                     chunkPositions.push_back( chunkPos );
                 }
@@ -1069,14 +1196,18 @@ MeshNoisePreview::VertexLightShader::VertexLightShader()
 #endif
     {
         mTransformationProjectionMatrixUniform = uniformLocation( "transformationProjectionMatrix" );
-        mColorTintUniform = uniformLocation( "colorTint" );
+        mLayerColorsUniform = uniformLocation( "layerColors" );
+        mLayerThresholdsUniform = uniformLocation( "layerThresholds" );
+        mLayerCountUniform = uniformLocation( "layerCount" );
+        mLayerSmoothnessUniform = uniformLocation( "layerSmoothness" );
     }
 
-    /* Set defaults in OpenGL ES (for desktop they are set in shader code itself) */
-#ifdef MAGNUM_TARGET_GLES
     SetTransformationProjectionMatrix( Matrix4{} );
-    SetColorTint( Color3 { 1.0f } );
-#endif
+    {
+        Color3 white { 1.0f };
+        float zero = 0.0f;
+        SetColorLayers( &white, &zero, 1, 0.0f );
+    }
 }
 
 GL::Shader MeshNoisePreview::VertexLightShader::CreateShader( GL::Version version, GL::Shader::Type type )
@@ -1113,10 +1244,153 @@ MeshNoisePreview::VertexLightShader& MeshNoisePreview::VertexLightShader::SetTra
     return *this;
 }
 
-MeshNoisePreview::VertexLightShader& MeshNoisePreview::VertexLightShader::SetColorTint( const Color3& color )
+MeshNoisePreview::VertexLightShader& MeshNoisePreview::VertexLightShader::SetColorLayers( const Color3* colors, const float* thresholds, int count, float smoothness )
 {
-    setUniform( mColorTintUniform, Vector4( color, 1.0f ) );
+    int clamped = std::max( 1, std::min( count, MAX_COLOR_LAYERS ) );
+
+    Vector4 packedColors[MAX_COLOR_LAYERS] = {};
+    float packedThresholds[MAX_COLOR_LAYERS] = {};
+    for( int i = 0; i < clamped; ++i )
+    {
+        packedColors[i] = Vector4( colors[i], 1.0f );
+        packedThresholds[i] = thresholds[i];
+    }
+
+    setUniform( mLayerColorsUniform, Containers::arrayView( packedColors ) );
+    setUniform( mLayerThresholdsUniform, Containers::arrayView( packedThresholds ) );
+    setUniform( mLayerCountUniform, clamped );
+    setUniform( mLayerSmoothnessUniform, smoothness );
     return *this;
+}
+
+bool MeshNoisePreview::IsChunkInsideBorder( const Vector3i& chunkPos ) const
+{
+    if( mGenerateOutsideBorder || mBorderShape == BorderShape_None )
+    {
+        return true;
+    }
+
+    float r = mBorderRadius;
+    float minX = (float)chunkPos.x();
+    float maxX = minX + (float)Chunk::SIZE;
+    float minZ = (float)chunkPos.z();
+    float maxZ = minZ + (float)Chunk::SIZE;
+
+    if( mBorderShape == BorderShape_Box )
+    {
+        return minX <= r && maxX >= -r && minZ <= r && maxZ >= -r;
+    }
+
+    float nx = std::clamp( 0.0f, minX, maxX );
+    float nz = std::clamp( 0.0f, minZ, maxZ );
+    return nx * nx + nz * nz <= r * r;
+}
+
+void MeshNoisePreview::RebuildBorderMesh()
+{
+    mBorderDirty = false;
+
+    std::vector<Vector3> verts;
+
+    if( mBorderShape != BorderShape_None )
+    {
+        int segments = mBorderShape == BorderShape_Circle ? std::max( 8, mBorderSegments ) : 4;
+        int rings = std::max( 1, mBorderRings );
+        float yMin = std::min( mBorderMinY, mBorderMaxY );
+        float yMax = std::max( mBorderMinY, mBorderMaxY );
+        float r = std::max( 0.001f, mBorderRadius );
+
+        std::vector<Vector3> ring( segments + 1 );
+        for( int i = 0; i <= segments; ++i )
+        {
+            if( mBorderShape == BorderShape_Circle )
+            {
+                float a = ( (float)i / (float)segments ) * 2.0f * Math::Constants<float>::pi();
+                ring[i] = Vector3( std::cos( a ) * r, 0.0f, std::sin( a ) * r );
+            }
+            else
+            {
+                static const Vector3 corners[5] = {
+                    {  1.0f, 0.0f,  1.0f },
+                    { -1.0f, 0.0f,  1.0f },
+                    { -1.0f, 0.0f, -1.0f },
+                    {  1.0f, 0.0f, -1.0f },
+                    {  1.0f, 0.0f,  1.0f },
+                };
+                ring[i] = corners[i] * r;
+            }
+        }
+
+        for( int rIdx = 0; rIdx < rings; ++rIdx )
+        {
+            float t = rings == 1 ? 0.0f : (float)rIdx / (float)( rings - 1 );
+            float y = yMin + ( yMax - yMin ) * t;
+            for( int i = 0; i < segments; ++i )
+            {
+                Vector3 a = ring[i];      a.y() = y;
+                Vector3 b = ring[i + 1];  b.y() = y;
+                verts.push_back( a );
+                verts.push_back( b );
+            }
+        }
+
+        int postCount = mBorderShape == BorderShape_Circle ? std::min( segments, std::max( 4, segments / 8 ) ) : 4;
+        for( int p = 0; p < postCount; ++p )
+        {
+            int idx = ( p * segments ) / postCount;
+            Vector3 base = ring[idx];
+            Vector3 a( base.x(), yMin, base.z() );
+            Vector3 b( base.x(), yMax, base.z() );
+            verts.push_back( a );
+            verts.push_back( b );
+        }
+    }
+
+    mBorderVertexCount = (int)verts.size();
+    if( mBorderVertexCount == 0 )
+    {
+        mBorderMesh.setCount( 0 );
+        return;
+    }
+
+    mBorderBuffer.setData( Containers::ArrayView<const Vector3>( verts.data(), verts.size() ), GL::BufferUsage::StaticDraw );
+    mBorderMesh.setCount( mBorderVertexCount );
+}
+
+void MeshNoisePreview::DrawBorder( const Matrix4& transformationProjection )
+{
+    if( mBorderShape == BorderShape_None || mBorderVertexCount == 0 )
+    {
+        return;
+    }
+
+    mBorderShader
+        .setTransformationProjectionMatrix( transformationProjection )
+        .setColor( Color4( mBorderColor, 1.0f ) )
+        .draw( mBorderMesh );
+}
+
+void MeshNoisePreview::UploadColorLayers()
+{
+    if( mColorLayers.empty() )
+    {
+        Color3 white { 1.0f };
+        float zero = 0.0f;
+        mShader.SetColorLayers( &white, &zero, 1, 0.0f );
+        return;
+    }
+
+    Color3 colors[VertexLightShader::MAX_COLOR_LAYERS];
+    float thresholds[VertexLightShader::MAX_COLOR_LAYERS];
+    int count = std::min( (int)mColorLayers.size(), VertexLightShader::MAX_COLOR_LAYERS );
+
+    for( int i = 0; i < count; ++i )
+    {
+        colors[i] = mColorLayers[i].color;
+        thresholds[i] = mColorLayers[i].threshold;
+    }
+
+    mShader.SetColorLayers( colors, thresholds, count, mLayerSmoothness );
 }
 
 void MeshNoisePreview::StartTimer()
@@ -1144,7 +1418,25 @@ void MeshNoisePreview::SetupSettingsHandlers()
         outBuf->appendf( "iso_surface=%f\n", meshNoisePreview->mBuildData.isoSurface );
         outBuf->appendf( "heightmap_multiplier=%f\n", meshNoisePreview->mBuildData.heightmapMultiplier );
         outBuf->appendf( "seed=%d\n", meshNoisePreview->mBuildData.seed );
-        outBuf->appendf( "color=%d\n", (int)meshNoisePreview->mBuildData.color.toSrgbInt() );
+        outBuf->appendf( "layer_smoothness=%f\n", meshNoisePreview->mLayerSmoothness );
+        outBuf->appendf( "layer_count=%d\n", (int)meshNoisePreview->mColorLayers.size() );
+        for( size_t i = 0; i < meshNoisePreview->mColorLayers.size(); ++i )
+        {
+            const auto& l = meshNoisePreview->mColorLayers[i];
+            outBuf->appendf( "layer_%zu=%d,%f\n", i, (int)l.color.toSrgbInt(), l.threshold );
+        }
+        outBuf->appendf( "border_shape=%d\n", (int)meshNoisePreview->mBorderShape );
+        outBuf->appendf( "border_radius=%f\n", meshNoisePreview->mBorderRadius );
+        outBuf->appendf( "border_min_y=%f\n", meshNoisePreview->mBorderMinY );
+        outBuf->appendf( "border_max_y=%f\n", meshNoisePreview->mBorderMaxY );
+        outBuf->appendf( "border_rings=%d\n", meshNoisePreview->mBorderRings );
+        outBuf->appendf( "border_segments=%d\n", meshNoisePreview->mBorderSegments );
+        outBuf->appendf( "border_color=%d\n", (int)meshNoisePreview->mBorderColor.toSrgbInt() );
+        outBuf->appendf( "generate_outside_border=%d\n", (int)meshNoisePreview->mGenerateOutsideBorder );
+        outBuf->appendf( "orbit_mode=%d\n", (int)meshNoisePreview->mOrbitMode );
+        outBuf->appendf( "orbit_distance=%f\n", meshNoisePreview->mOrbitDistance );
+        outBuf->appendf( "orbit_height=%f\n", meshNoisePreview->mOrbitHeight );
+        outBuf->appendf( "fov_deg=%f\n", meshNoisePreview->mFovDeg );
         outBuf->appendf( "mesh_type=%d\n", (int)meshNoisePreview->mBuildData.meshType );
         outBuf->appendf( "up_axis=%d\n", (int)meshNoisePreview->mUpAxis );
         outBuf->appendf( "enabled=%d\n", (int)meshNoisePreview->mEnabled );
@@ -1168,10 +1460,50 @@ void MeshNoisePreview::SetupSettingsHandlers()
         sscanf( line, "mesh_type=%d", (int*)&meshNoisePreview->mBuildData.meshType );
         sscanf( line, "up_axis=%d", (int*)&meshNoisePreview->mUpAxis );
 
+        sscanf( line, "layer_smoothness=%f", &meshNoisePreview->mLayerSmoothness );
+
+        int layerCount;
+        int colorInt;
+        float threshold;
         int i;
-        if( sscanf( line, "color=%d", &i ) == 1 )
+
+        if( sscanf( line, "border_shape=%d", &i ) == 1 )
         {
-            meshNoisePreview->mBuildData.color = Color3::fromSrgbInt( i );
+            meshNoisePreview->mBorderShape = (BorderShape)i;
+            meshNoisePreview->mBorderDirty = true;
+        }
+        if( sscanf( line, "border_radius=%f", &meshNoisePreview->mBorderRadius ) == 1 ) meshNoisePreview->mBorderDirty = true;
+        if( sscanf( line, "border_min_y=%f", &meshNoisePreview->mBorderMinY ) == 1 ) meshNoisePreview->mBorderDirty = true;
+        if( sscanf( line, "border_max_y=%f", &meshNoisePreview->mBorderMaxY ) == 1 ) meshNoisePreview->mBorderDirty = true;
+        if( sscanf( line, "border_rings=%d", &meshNoisePreview->mBorderRings ) == 1 ) meshNoisePreview->mBorderDirty = true;
+        if( sscanf( line, "border_segments=%d", &meshNoisePreview->mBorderSegments ) == 1 ) meshNoisePreview->mBorderDirty = true;
+        if( sscanf( line, "border_color=%d", &i ) == 1 )
+        {
+            meshNoisePreview->mBorderColor = Color3::fromSrgbInt( i );
+        }
+        if( sscanf( line, "generate_outside_border=%d", &i ) == 1 )
+        {
+            meshNoisePreview->mGenerateOutsideBorder = (bool)i;
+        }
+        if( sscanf( line, "orbit_mode=%d", &i ) == 1 )
+        {
+            meshNoisePreview->mOrbitMode = (bool)i;
+        }
+        sscanf( line, "orbit_distance=%f", &meshNoisePreview->mOrbitDistance );
+        sscanf( line, "orbit_height=%f", &meshNoisePreview->mOrbitHeight );
+        sscanf( line, "fov_deg=%f", &meshNoisePreview->mFovDeg );
+
+        if( sscanf( line, "layer_count=%d", &layerCount ) == 1 )
+        {
+            meshNoisePreview->mColorLayers.clear();
+            meshNoisePreview->mColorLayers.reserve( std::min( layerCount, VertexLightShader::MAX_COLOR_LAYERS ) );
+        }
+        else if( sscanf( line, "layer_%*d=%d,%f", &colorInt, &threshold ) == 2 )
+        {
+            if( (int)meshNoisePreview->mColorLayers.size() < VertexLightShader::MAX_COLOR_LAYERS )
+            {
+                meshNoisePreview->mColorLayers.push_back( { Color3::fromSrgbInt( colorInt ), threshold } );
+            }
         }
         else if( sscanf( line, "enabled=%d", &i ) == 1 )
         {

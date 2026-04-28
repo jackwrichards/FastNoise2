@@ -12,6 +12,7 @@
 #include <Magnum/Math/Color.h>
 #include <Magnum/GL/AbstractShaderProgram.h>
 #include <Magnum/GL/Shader.h>
+#include <Magnum/Shaders/FlatGL.h>
 
 #include <robin_hood.h>
 
@@ -29,6 +30,23 @@ namespace Magnum
         void ReGenerate( FastNoise::SmartNodeArg<> generator );
 
         void Draw( const Matrix4& transformation, const Matrix4& projection, const Vector3& cameraPosition );
+
+        struct ColorLayer
+        {
+            Color3 color;
+            float threshold;
+        };
+
+        const std::vector<ColorLayer>& GetColorLayers() const { return mColorLayers; }
+        float GetLayerSmoothness() const { return mLayerSmoothness; }
+        float GetHeightmapMultiplier() const { return mBuildData.heightmapMultiplier; }
+
+        bool GetOrbitMode() const { return mOrbitMode; }
+        float GetFovDeg() const { return mFovDeg; }
+        float GetOrbitDistance() const { return mOrbitDistance; }
+        void SetOrbitDistance( float d ) { mOrbitDistance = std::clamp( d, 5.0f, 5000.0f ); }
+        float GetOrbitHeight() const { return mOrbitHeight; }
+        void SetOrbitHeight( float h ) { mOrbitHeight = std::clamp( h, -5000.0f, 5000.0f ); }
 
     private:
         enum MeshType
@@ -68,14 +86,19 @@ namespace Magnum
             VertexLightShader& operator=( const VertexLightShader& ) = delete;
             VertexLightShader& operator=( VertexLightShader&& ) noexcept = default;
 
+            static constexpr int MAX_COLOR_LAYERS = 8;
+
             VertexLightShader& SetTransformationProjectionMatrix( const Matrix4& matrix );
-            VertexLightShader& SetColorTint( const Color3& color );
+            VertexLightShader& SetColorLayers( const Color3* colors, const float* thresholds, int count, float smoothness );
 
         private:
             GL::Shader CreateShader( GL::Version version, GL::Shader::Type type );
 
             int mTransformationProjectionMatrixUniform = 0;
-            int mColorTintUniform = 1;
+            int mLayerColorsUniform = 1;
+            int mLayerThresholdsUniform = 9;
+            int mLayerCountUniform = 17;
+            int mLayerSmoothnessUniform = 18;
         };
 
         class Chunk
@@ -136,7 +159,6 @@ namespace Magnum
                 FastNoise::SmartNode<const FastNoise::Generator> generator;
                 FastNoise::SmartNode<FastNoise::DomainScale> generatorScaled;
                 Vector3i pos;
-                Color3 color;
                 float scale, isoSurface, heightmapMultiplier;
                 int32_t seed;
                 MeshType meshType;
@@ -186,6 +208,8 @@ namespace Magnum
 
         static void GenerateLoopThread( GenerateQueue<Chunk::BuildData>& generateQueue, CompleteQueue<Chunk::MeshData>& completeQueue );
 
+        void UploadColorLayers();
+
         void UpdateChunksForPosition( Vector3 position );
         void UpdateChunkQueues( const Vector3& position );
         float GetLoadRangeModifier();
@@ -216,5 +240,45 @@ namespace Magnum
         std::chrono::high_resolution_clock::time_point mTimerStart;
 
         VertexLightShader mShader;
+
+        std::vector<ColorLayer> mColorLayers;
+        float mLayerSmoothness = 0.0f;
+
+        enum BorderShape
+        {
+            BorderShape_None,
+            BorderShape_Circle,
+            BorderShape_Box,
+            BorderShape_Count
+        };
+
+        inline static const char* BorderShapeStrings =
+            "None\0"
+            "Circle\0"
+            "Box\0";
+
+        void RebuildBorderMesh();
+        void DrawBorder( const Matrix4& transformationProjection );
+        bool IsChunkInsideBorder( const Vector3i& chunkPos ) const;
+
+        BorderShape mBorderShape = BorderShape_None;
+        bool mGenerateOutsideBorder = true;
+        float mBorderRadius = 256.0f;
+        float mBorderMinY = 0.0f;
+        float mBorderMaxY = 100.0f;
+        int mBorderRings = 4;
+        int mBorderSegments = 64;
+        Color3 mBorderColor = Color3( 1.0f, 0.85f, 0.2f );
+        bool mBorderDirty = true;
+
+        Shaders::FlatGL3D mBorderShader { NoCreate };
+        GL::Buffer mBorderBuffer { NoCreate };
+        GL::Mesh mBorderMesh { NoCreate };
+        int mBorderVertexCount = 0;
+
+        bool mOrbitMode = false;
+        float mOrbitDistance = 400.0f;
+        float mOrbitHeight = 0.0f;
+        float mFovDeg = 70.0f;
     };
 }

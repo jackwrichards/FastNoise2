@@ -14,7 +14,10 @@
 #include <Magnum/PixelFormat.h>
 #include <Magnum/GL/TextureFormat.h>
 #include <Magnum/ImGuiIntegration/Widgets.h>
+#include <Magnum/Math/Matrix4.h>
+#include <Magnum/Math/Vector3.h>
 #include <Corrade/Containers/ArrayViewStl.h>
+#include <cmath>
 
 #include "util/ImGuiExtra.h"
 #include "util/DemoNodeTrees.inl"
@@ -130,9 +133,148 @@ FastNoiseNodeEditor::Node::Node( FastNoiseNodeEditor& e, std::unique_ptr<FastNoi
     }
 }
 
+namespace
+{
+    inline Color3 SampleColorRamp( float y, const std::vector<MeshNoisePreview::ColorLayer>& layers, float smoothness )
+    {
+        if( layers.empty() ) return Color3( 1.0f );
+        Color3 col = layers[0].color;
+        for( size_t i = 1; i < layers.size(); ++i )
+        {
+            float t = layers[i].threshold;
+            if( smoothness > 0.0f )
+            {
+                float a = std::clamp( ( y - ( t - smoothness ) ) / ( 2.0f * smoothness ), 0.0f, 1.0f );
+                float blend = a * a * ( 3.0f - 2.0f * a );
+                col = col * ( 1.0f - blend ) + layers[i].color * blend;
+            }
+            else if( y >= t )
+            {
+                col = layers[i].color;
+            }
+        }
+        return col;
+    }
+
+    inline uint32_t PackColor( const Color3& c, float shade = 1.0f )
+    {
+        float r = std::clamp( c.r() * shade * 255.0f, 0.0f, 255.0f );
+        float g = std::clamp( c.g() * shade * 255.0f, 0.0f, 255.0f );
+        float b = std::clamp( c.b() * shade * 255.0f, 0.0f, 255.0f );
+        return 0xFF000000u | ( (uint32_t)b << 16 ) | ( (uint32_t)g << 8 ) | (uint32_t)r;
+    }
+
+    inline float SampleVolume( const float* volume, int VS, const Vector3& p )
+    {
+        float fx = ( p.x() + 0.5f ) * ( VS - 1 );
+        float fy = ( p.y() + 0.5f ) * ( VS - 1 );
+        float fz = ( p.z() + 0.5f ) * ( VS - 1 );
+        int ix = std::clamp( (int)fx, 0, VS - 1 );
+        int iy = std::clamp( (int)fy, 0, VS - 1 );
+        int iz = std::clamp( (int)fz, 0, VS - 1 );
+        return volume[(size_t)iz * VS * VS + (size_t)iy * VS + ix];
+    }
+
+    void RenderCubeFrame( const float* volume, int VS, uint32_t* out, int outW, int outH, float angle, float iso,
+                          const std::vector<MeshNoisePreview::ColorLayer>& layers, float smoothness, float heightMult, bool useColors )
+    {
+        constexpr float R = 2.4f;
+        constexpr float H = 1.7f;
+        constexpr float halfExtent = 0.95f;
+        constexpr int marchSteps = 96;
+
+        Vector3 eye( std::cos( angle ) * R, H, std::sin( angle ) * R );
+        Matrix4 cam = Matrix4::lookAt( eye, Vector3{ 0.0f }, Vector3::yAxis() );
+        Vector3 wsDir = cam.transformVector( Vector3( 0.0f, 0.0f, -1.0f ) ).normalized();
+        Vector3 lightDir = Vector3( 0.5f, 0.8f, 0.3f ).normalized();
+        float gradH = 1.5f / VS;
+
+        for( int py = 0; py < outH; ++py )
+        {
+            float ndcY = 2.0f * ( py + 0.5f ) / outH - 1.0f;
+            for( int px = 0; px < outW; ++px )
+            {
+                float ndcX = 2.0f * ( px + 0.5f ) / outW - 1.0f;
+                Vector3 wsPos = cam.transformPoint( Vector3( ndcX * halfExtent, ndcY * halfExtent, 0.0f ) );
+
+                float tNear = -INFINITY, tFar = INFINITY;
+                bool miss = false;
+                for( int axis = 0; axis < 3; ++axis )
+                {
+                    float o = wsPos[axis], d = wsDir[axis];
+                    if( std::abs( d ) < 1e-6f )
+                    {
+                        if( o < -0.5f || o > 0.5f ) { miss = true; break; }
+                    }
+                    else
+                    {
+                        float t1 = ( -0.5f - o ) / d;
+                        float t2 = ( 0.5f - o ) / d;
+                        if( t1 > t2 ) std::swap( t1, t2 );
+                        if( t1 > tNear ) tNear = t1;
+                        if( t2 < tFar ) tFar = t2;
+                    }
+                }
+
+                int idx = py * outW + px;
+                if( miss || tNear > tFar || tFar < 0.0f )
+                {
+                    out[idx] = 0;
+                    continue;
+                }
+
+                float t0 = std::max( 0.0f, tNear );
+                float t1 = tFar;
+                float dt = ( t1 - t0 ) / (float)marchSteps;
+
+                uint32_t color = 0;
+                for( int s = 0; s <= marchSteps; ++s )
+                {
+                    float t = t0 + s * dt;
+                    Vector3 p = wsPos + wsDir * t;
+                    float val = SampleVolume( volume, VS, p );
+
+                    if( val <= iso )
+                    {
+                        float nx = SampleVolume( volume, VS, p + Vector3( gradH, 0, 0 ) ) - SampleVolume( volume, VS, p - Vector3( gradH, 0, 0 ) );
+                        float ny = SampleVolume( volume, VS, p + Vector3( 0, gradH, 0 ) ) - SampleVolume( volume, VS, p - Vector3( 0, gradH, 0 ) );
+                        float nz = SampleVolume( volume, VS, p + Vector3( 0, 0, gradH ) ) - SampleVolume( volume, VS, p - Vector3( 0, 0, gradH ) );
+                        Vector3 n( nx, ny, nz );
+                        float lenSq = n.dot();
+                        if( lenSq < 1e-12f ) n = -wsDir;
+                        else n = n / std::sqrt( lenSq );
+
+                        float ndotl = std::max( 0.0f, Math::dot( n, lightDir ) );
+                        float ambient = 0.3f;
+                        float shade = ambient + ( 1.0f - ambient ) * ndotl;
+
+                        float depthFade = 1.0f - 0.25f * std::clamp( ( t - tNear ) / std::max( 1e-6f, tFar - tNear ), 0.0f, 1.0f );
+                        shade *= depthFade;
+
+                        if( useColors )
+                        {
+                            float fakeY = p.y() * heightMult;
+                            Color3 rampColor = SampleColorRamp( fakeY, layers, smoothness );
+                            color = PackColor( rampColor, shade );
+                        }
+                        else
+                        {
+                            color = PackColor( Color3( 1.0f ), shade );
+                        }
+                        break;
+                    }
+                }
+
+                out[idx] = color;
+            }
+        }
+    }
+}
+
 void FastNoiseNodeEditor::Node::GeneratePreview( bool nodeTreeChanged, bool benchmark )
 {
-    static std::array<float, NoiseSize * NoiseSize> noiseData;
+    static std::array<float, NoiseSize * NoiseSize> rawNoiseData;
+    static std::array<uint32_t, NoiseSize * NoiseSize> noiseData;
 
     serialised = FastNoise::Metadata::SerialiseNodeData( data.get(), true );
     auto generator = FastNoise::NewFromEncodedNodeTree( serialised.c_str(), editor.mMaxFeatureSet );
@@ -144,12 +286,9 @@ void FastNoiseNodeEditor::Node::GeneratePreview( bool nodeTreeChanged, bool benc
 
     if( generator )
     {
-        auto genRGB = FastNoise::New<FastNoise::ConvertRGBA8>( editor.mMaxFeatureSet );
-        genRGB->SetSource( generator );
-        
         auto startTime = std::chrono::high_resolution_clock::now();
 
-        editor.GenerateNodePreviewNoise( genRGB.get(), noiseData.data() );
+        editor.GenerateNodePreviewNoise( generator.get(), rawNoiseData.data() );
 
         generateAverages.push_back( std::chrono::duration_cast<std::chrono::nanoseconds>( std::chrono::high_resolution_clock::now() - startTime ).count() - editor.mOverheadNode.totalGenerateNs );
 
@@ -159,19 +298,93 @@ void FastNoiseNodeEditor::Node::GeneratePreview( bool nodeTreeChanged, bool benc
     }
     else
     {
-        std::fill( noiseData.begin(), noiseData.end(), 0.0f );
         serialised.clear();
         totalGenerateNs = 0;
     }
 
     if( benchmark )
     {
-        return;        
+        return;
     }
 
-    ImageView2D noiseImage( PixelFormat::RGBA8Unorm, { NoiseSize, NoiseSize }, noiseData );
+    {
+        const auto& layers = editor.mMeshNoisePreview.GetColorLayers();
+        float smoothness = editor.mMeshNoisePreview.GetLayerSmoothness();
+        float heightMult = editor.mMeshNoisePreview.GetHeightmapMultiplier();
 
-    noiseTexture.setStorage( 1, GL::TextureFormat::RGBA8, noiseImage.size() ).setSubImage( 0, {}, noiseImage );
+        if( generator )
+        {
+            bool useColors = editor.mNodePreviewUseColors;
+            for( int i = 0; i < NoiseSize * NoiseSize; ++i )
+            {
+                if( useColors )
+                {
+                    float fakeY = rawNoiseData[i] * heightMult;
+                    Color3 c = SampleColorRamp( fakeY, layers, smoothness );
+                    noiseData[i] = PackColor( c );
+                }
+                else
+                {
+                    float v = std::clamp( rawNoiseData[i] * 0.5f + 0.5f, 0.0f, 1.0f );
+                    noiseData[i] = PackColor( Color3( v ) );
+                }
+            }
+        }
+        else
+        {
+            std::fill( noiseData.begin(), noiseData.end(), 0u );
+        }
+    }
+
+    bool wantCube = editor.mNodeGenType == NoiseTexture::GenType_3DCube && generator;
+
+    if( wantCube )
+    {
+        const int VS = CubeVolumeSize;
+        const int RS = CubeRenderSize;
+        std::vector<float> volume( (size_t)VS * VS * VS );
+        std::vector<uint32_t> strip( (size_t)RS * RS * CubeFrames );
+
+        float cubeScale = editor.mCubeScale;
+        float volOffset = -VS / 2.0f * cubeScale;
+        generator->GenUniformGrid3D( volume.data(),
+            volOffset, volOffset, volOffset,
+            VS, VS, VS, cubeScale, cubeScale, cubeScale, editor.mNodeSeed );
+
+        const float twoPi = 6.28318530718f;
+        const float iso = 0.0f;
+        const auto& layers = editor.mMeshNoisePreview.GetColorLayers();
+        float smoothness = editor.mMeshNoisePreview.GetLayerSmoothness();
+        float heightMult = editor.mMeshNoisePreview.GetHeightmapMultiplier();
+        for( int f = 0; f < CubeFrames; ++f )
+        {
+            float angle = twoPi * (float)f / (float)CubeFrames;
+            uint32_t* frameOut = strip.data() + (size_t)f * RS * RS;
+            RenderCubeFrame( volume.data(), VS, frameOut, RS, RS, angle, iso, layers, smoothness, heightMult, editor.mNodePreviewUseColors );
+        }
+
+        ImageView2D cubeImage( PixelFormat::RGBA8Unorm,
+            { RS, RS * CubeFrames },
+            Containers::ArrayView<const char>{ reinterpret_cast<const char*>( strip.data() ),
+                                               strip.size() * sizeof( uint32_t ) } );
+
+        noiseTexture = GL::Texture2D{};
+        noiseTexture.setStorage( 1, GL::TextureFormat::RGBA8, cubeImage.size() ).setSubImage( 0, {}, cubeImage );
+        isCubeStrip = true;
+    }
+    else
+    {
+        ImageView2D noiseImage( PixelFormat::RGBA8Unorm, { NoiseSize, NoiseSize },
+            Containers::ArrayView<const char>{ reinterpret_cast<const char*>( noiseData.data() ),
+                                               noiseData.size() * sizeof( uint32_t ) } );
+
+        if( isCubeStrip )
+        {
+            noiseTexture = GL::Texture2D{};
+            isCubeStrip = false;
+        }
+        noiseTexture.setStorage( 1, GL::TextureFormat::RGBA8, noiseImage.size() ).setSubImage( 0, {}, noiseImage );
+    }
     
     for( auto& node : editor.mNodes )
     {
@@ -484,6 +697,9 @@ void FastNoiseNodeEditor::SetupSettingsHandlers()
         outBuf->appendf( "scale=%f\n", nodeEditor->mNodeScale );
         outBuf->appendf( "seed=%d\n", nodeEditor->mNodeSeed );
         outBuf->appendf( "gen_type=%d\n", (int)nodeEditor->mNodeGenType );
+        outBuf->appendf( "cube_scale=%f\n", nodeEditor->mCubeScale );
+        outBuf->appendf( "cube_spin=%f\n", nodeEditor->mCubeSpinRotPerSec );
+        outBuf->appendf( "preview_use_colors=%d\n", (int)nodeEditor->mNodePreviewUseColors );
         
         auto find = nodeEditor->mNodes.find( nodeEditor->mSelectedNode );
 
@@ -514,6 +730,14 @@ void FastNoiseNodeEditor::SetupSettingsHandlers()
         sscanf( line, "scale=%f", &nodeEditor->mNodeScale );
         sscanf( line, "seed=%d", &nodeEditor->mNodeSeed );
         sscanf( line, "gen_type=%d", (int*)&nodeEditor->mNodeGenType );
+        sscanf( line, "cube_scale=%f", &nodeEditor->mCubeScale );
+        sscanf( line, "cube_spin=%f", &nodeEditor->mCubeSpinRotPerSec );
+
+        int previewColors;
+        if( sscanf( line, "preview_use_colors=%d", &previewColors ) == 1 )
+        {
+            nodeEditor->mNodePreviewUseColors = (bool)previewColors;
+        }
 
         if( nodeEditor->mNodeEditorApp.IsDetachedNodeGraph() )
         {
@@ -778,6 +1002,23 @@ void FastNoiseNodeEditor::Draw( const Matrix4& transformation, const Matrix4& pr
                 
                 edited |= ImGui::DragInt( "Seed", &mNodeSeed );
                 edited |= ImGui::DragFloat( "Scale", &mNodeScale, 0.01f );
+                edited |= ImGui::Checkbox( "Use Color Layers", &mNodePreviewUseColors );
+
+                if( mNodeGenType == NoiseTexture::GenType_3DCube )
+                {
+                    ImGui::Separator();
+                    ImGui::DragFloat( "Cube Scale", &mCubeScale, 0.01f, 0.001f, 100.0f, "%.3f" );
+                    if( ImGui::IsItemDeactivatedAfterEdit() )
+                    {
+                        edited = true;
+                    }
+
+                    bool spinDirty = ImGui::SliderFloat( "Spin (rot/sec)", &mCubeSpinRotPerSec, -2.0f, 2.0f, "%.2f" );
+                    if( spinDirty )
+                    {
+                        mSettingsDirty = true;
+                    }
+                }
 
                 ImGui::PopItemWidth();
                 
@@ -1282,12 +1523,18 @@ void FastNoiseNodeEditor::DoNodes()
         ImNodes::BeginOutputAttribute( node.second.GetOutputAttributeId(), ImNodesPinShape_QuadFilled );
 
         Vector2 noiseSize = { (float)Node::NoiseSize, (float)Node::NoiseSize };
-        if( mSelectedNode == node.first && !node.second.serialised.empty() )
+        if( node.second.isCubeStrip )
         {
-            ImVec2 cursorPos = ImGui::GetCursorScreenPos();
-            ImGui::RenderFrame( cursorPos - ImVec2( 1, 1 ), cursorPos + ImVec2( noiseSize ) + ImVec2( 1, 1 ), IM_COL32( 255, 0, 0, 200 ), false );
+            float t = (float)( ImGui::GetTime() * mCubeSpinRotPerSec );
+            int frame = ( (int)std::floor( t * Node::CubeFrames ) % Node::CubeFrames + Node::CubeFrames ) % Node::CubeFrames;
+            float v0 = (float)frame / Node::CubeFrames;
+            float v1 = (float)( frame + 1 ) / Node::CubeFrames;
+            ImGuiIntegration::image( node.second.noiseTexture, noiseSize, Range2D{ { 0.0f, v0 }, { 1.0f, v1 } } );
         }
-        ImGuiIntegration::image( node.second.noiseTexture, noiseSize );
+        else
+        {
+            ImGuiIntegration::image( node.second.noiseTexture, noiseSize );
+        }
 
         if( ImGui::IsItemClicked( ImGuiMouseButton_Left ) )
         {
@@ -1520,6 +1767,7 @@ FastNoise::OutputMinMax FastNoiseNodeEditor::GenerateNodePreviewNoise( FastNoise
             Node::NoiseSize, Node::NoiseSize, mNodeScale, mNodeScale, mNodeSeed );
 
     case NoiseTexture::GenType_3D:
+    case NoiseTexture::GenType_3DCube:
         return gen->GenUniformGrid3D( noise,
             xOffset, yOffset, 0.0f,
             Node::NoiseSize, Node::NoiseSize, 1, mNodeScale, mNodeScale, mNodeScale, mNodeSeed );
